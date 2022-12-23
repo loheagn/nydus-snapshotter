@@ -591,6 +591,10 @@ func TestUnpack(t *testing.T) {
 	testUnpack(t, "6")
 }
 
+func TestDebugUnpack(t *testing.T) {
+	testUnpack(t, "5")
+}
+
 func testUnpack(t *testing.T, fsVersion string) {
 	workDir, err := os.MkdirTemp("", "nydus-converter-test-")
 	require.NoError(t, err)

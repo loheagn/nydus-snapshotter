@@ -57,6 +57,7 @@ type MergeOption struct {
 
 type UnpackOption struct {
 	BuilderPath   string
+	CSProxySocket string
 	BootstrapPath string
 	BlobPath      string
 	TarPath       string
@@ -252,7 +253,10 @@ func Unpack(option UnpackOption) error {
 		"--output",
 		option.TarPath,
 	}
-	if option.BlobPath != "" {
+
+	if option.CSProxySocket != "" {
+		args = append(args, "--cs-proxy-socket", option.CSProxySocket)
+	} else if option.BlobPath != "" {
 		args = append(args, "--blob", option.BlobPath)
 	}
 

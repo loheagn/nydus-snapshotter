@@ -119,8 +119,8 @@ func unpackOciTar(ctx context.Context, dst string, reader io.Reader) error {
 	return nil
 }
 
-// Unpack a Nydus formatted tar stream into a directory.
-func unpackNydusBlob(bootDst, blobDst string, ra content.ReaderAt) error {
+// Unpack the bootstrap of a Nydus formatted tar stream into a directory.
+func unpackNydusBootstrap(bootDst string, ra content.ReaderAt) error {
 	boot, err := os.OpenFile(bootDst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return errors.Wrapf(err, "write to bootstrap %s", bootDst)
@@ -131,20 +131,10 @@ func unpackNydusBlob(bootDst, blobDst string, ra content.ReaderAt) error {
 		return errors.Wrap(err, "unpack bootstrap from nydus")
 	}
 
-	blob, err := os.OpenFile(blobDst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return errors.Wrapf(err, "write to blob %s", blobDst)
-	}
-	defer blob.Close()
-
-	if _, err = UnpackEntry(ra, EntryBlob, blob); err != nil {
-		return errors.Wrap(err, "unpack blob from nydus")
-	}
-
 	return nil
 }
 
-func seekFileByTarHeader(ra content.ReaderAt, targetName string, handle func(io.Reader, io.Reader) error) error {
+func seekFileByTarHeader(ra content.ReaderAt, targetName string, handle func(io.Reader, *tar.Header) error) error {
 	const headerSize = 512
 
 	if headerSize > ra.Size() {
@@ -180,10 +170,9 @@ func seekFileByTarHeader(ra content.ReaderAt, targetName string, handle func(io.
 			if err != nil {
 				return errors.Wrap(err, "seek target data offset")
 			}
-			headerReader := io.NewSectionReader(reader, cur+hdr.Size, headerSize)
 			dataReader := io.NewSectionReader(reader, cur-hdr.Size, hdr.Size)
 
-			if err := handle(dataReader, headerReader); err != nil {
+			if err := handle(dataReader, hdr); err != nil {
 				return errors.Wrap(err, "handle target data")
 			}
 
@@ -199,11 +188,11 @@ func seekFileByTarHeader(ra content.ReaderAt, targetName string, handle func(io.
 	return errors.Wrapf(ErrNotFound, "can't find target %s by seeking tar", targetName)
 }
 
-func seekFileByTOC(ra content.ReaderAt, targetName string, handle func(io.Reader, io.Reader) error) (*TOCEntry, error) {
+func seekFileByTOC(ra content.ReaderAt, targetName string, handle func(io.Reader, *tar.Header) error) (*TOCEntry, error) {
 	entrySize := 128
 	var tocEntry *TOCEntry
 
-	err := seekFileByTarHeader(ra, EntryTOC, func(tocEntryDataReader io.Reader, tarHeaderReader io.Reader) error {
+	err := seekFileByTarHeader(ra, EntryTOC, func(tocEntryDataReader io.Reader, _ *tar.Header) error {
 		entryData, err := io.ReadAll(tocEntryDataReader)
 		if err != nil {
 			return errors.Wrap(err, "read toc entries")
@@ -265,7 +254,7 @@ func seekFileByTOC(ra content.ReaderAt, targetName string, handle func(io.Reader
 //
 // `data | tar_header | ... | data | tar_header | [toc_entry | ... | toc_entry | tar_header]`
 func UnpackEntry(ra content.ReaderAt, targetName string, target io.Writer) (*TOCEntry, error) {
-	handle := func(dataReader io.Reader, tarHeaderReader io.Reader) error {
+	handle := func(dataReader io.Reader, _ *tar.Header) error {
 		// Copy data to provided target writer.
 		if _, err := io.Copy(target, dataReader); err != nil {
 			return errors.Wrap(err, "copy target data to reader")
@@ -274,6 +263,10 @@ func UnpackEntry(ra content.ReaderAt, targetName string, target io.Writer) (*TOC
 		return nil
 	}
 
+	return seekFile(ra, targetName, handle)
+}
+
+func seekFile(ra content.ReaderAt, targetName string, handle func(io.Reader, *tar.Header) error) (*TOCEntry, error) {
 	// Try seek target data by TOC.
 	entry, err := seekFileByTOC(ra, targetName, handle)
 	if err != nil {
@@ -452,8 +445,8 @@ func packRef(ctx context.Context, dest io.Writer, opt PackOption) (io.WriteClose
 
 func calcBlobTOCDigest(ra content.ReaderAt) (*digest.Digest, error) {
 	digester := digest.Canonical.Digester()
-	if err := seekFileByTarHeader(ra, EntryTOC, func(tocData io.Reader, tarHeader io.Reader) error {
-		if _, err := io.Copy(digester.Hash(), io.MultiReader(tocData, tarHeader)); err != nil {
+	if err := seekFileByTarHeader(ra, EntryTOC, func(tocData io.Reader, _ *tar.Header) error {
+		if _, err := io.Copy(digester.Hash(), tocData); err != nil {
 			return errors.Wrap(err, "calc toc data and header digest")
 		}
 		return nil
@@ -573,11 +566,6 @@ func Unpack(ctx context.Context, ra content.ReaderAt, dest io.Writer, opt Unpack
 	}
 	defer os.RemoveAll(workDir)
 
-	bootPath, blobPath := filepath.Join(workDir, EntryBootstrap), filepath.Join(workDir, EntryBlob)
-	if err = unpackNydusBlob(bootPath, blobPath, ra); err != nil {
-		return errors.Wrap(err, "unpack nydus tar")
-	}
-
 	tarPath := filepath.Join(workDir, "oci.tar")
 	blobFifo, err := fifo.OpenFifo(ctx, tarPath, syscall.O_CREAT|syscall.O_RDONLY|syscall.O_NONBLOCK, 0644)
 	if err != nil {
@@ -585,32 +573,56 @@ func Unpack(ctx context.Context, ra content.ReaderAt, dest io.Writer, opt Unpack
 	}
 	defer blobFifo.Close()
 
-	unpackErrChan := make(chan error)
-	go func() {
-		defer close(unpackErrChan)
-		err := tool.Unpack(tool.UnpackOption{
-			BuilderPath:   getBuilder(opt.BuilderPath),
-			BootstrapPath: bootPath,
-			BlobPath:      blobPath,
-			TarPath:       tarPath,
-			Timeout:       opt.Timeout,
-		})
-		if err != nil {
-			blobFifo.Close()
-			unpackErrChan <- err
-		}
-	}()
-
-	buffer := bufPool.Get().(*[]byte)
-	defer bufPool.Put(buffer)
-	if _, err := io.CopyBuffer(dest, blobFifo, *buffer); err != nil {
-		if unpackErr := <-unpackErrChan; unpackErr != nil {
-			return errors.Wrap(unpackErr, "unpack")
-		}
-		return errors.Wrap(err, "copy oci tar")
+	bootPath := filepath.Join(workDir, EntryBootstrap)
+	if err := unpackNydusBootstrap(bootPath, ra); err != nil {
+		return errors.Wrap(err, "unpack nydus bootstrap")
 	}
 
-	return nil
+	proxy, err := newContentStoreProxy(opt.WorkDir)
+	if err != nil {
+		return errors.Wrap(err, "new proxy")
+	}
+	defer proxy.close()
+
+	go proxy.serve(ra)
+
+	unpackErrChan := make(chan error)
+	go func() {
+		go func() {
+			defer close(unpackErrChan)
+			err := tool.Unpack(tool.UnpackOption{
+				BuilderPath:   getBuilder(opt.BuilderPath),
+				BootstrapPath: bootPath,
+				CSProxySocket: proxy.localAddr,
+				TarPath:       tarPath,
+				Timeout:       opt.Timeout,
+			})
+			if err != nil {
+				blobFifo.Close()
+				unpackErrChan <- err
+			}
+		}()
+
+		buffer := bufPool.Get().(*[]byte)
+		defer bufPool.Put(buffer)
+		if _, err := io.CopyBuffer(dest, blobFifo, *buffer); err != nil {
+			if unpackErr := <-unpackErrChan; unpackErr != nil {
+				unpackErrChan <- errors.Wrap(unpackErr, "unpack")
+			}
+			unpackErrChan <- errors.Wrap(err, "copy oci tar")
+		}
+		// unpackErrChan <- nil
+	}()
+
+	select {
+	case err := <-unpackErrChan:
+		return err
+	case err := <-proxy.errChan:
+		if err != nil {
+			return errors.Wrap(err, "content store proxy error")
+		}
+		return nil
+	}
 }
 
 // IsNydusBlobAndExists returns true when the specified digest of content exists in
